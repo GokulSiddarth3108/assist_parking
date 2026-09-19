@@ -1,5 +1,3 @@
-# assist_parking
-
 # Automotive Sensor Fault Detection & Isolation (FDI)
 
 ### QNX 8.0 • Raspberry Pi 5 • Real-Time Automotive Safety Prototype
