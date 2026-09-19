@@ -784,41 +784,10 @@ The QNX System Profiler provides visibility into CPU activity, thread
 execution, and system behaviour instead of relying only on theoretical
 estimates.
 
-------------------------------------------------------------------------
-
-# 22. Current Prototype Status
-
-  Capability                   Status
-  --------------------------- --------
-  QNX 8.0 on Raspberry Pi 5      ✅
-  Ultrasonic sensor 1            ✅
-  Ultrasonic sensor 2            ✅
-  IMU 1                          ✅
-  IMU 2                          ✅
-  IMU identification             ✅
-  IMU calibration                ✅
-  Sensor buffering               ✅
-  Sensor/fusion pipeline         ✅
-  Fault detection                ✅
-  Stuck-at detection             ✅
-  Stale/delayed detection        ✅
-  Noisy detection                ✅
-  Contradictory detection        ✅
-  Sensor health states           ✅
-  Fault isolation                ✅
-  Recovery/probing               ✅
-  Sensor exclusion               ✅
-  Reintegration path             ✅
-  Degraded operation             ✅
-  Holdover operation             ✅
-  Fault timeline                 ✅
-  QNX message queues             ✅
-  Real-time scheduling           ✅
-  QNX System Profiler            ✅
 
 ------------------------------------------------------------------------
 
-# 23. Future Extensions
+# 22. Future Extensions
 
 The prototype can be extended with:
 
@@ -835,7 +804,7 @@ The prototype can be extended with:
 
 ------------------------------------------------------------------------
 
-# 24. Conclusion
+# 23. Conclusion
 
 This project demonstrates a complete prototype of an automotive **Sensor
 Fault Detection & Isolation** architecture on QNX.
