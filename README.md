@@ -1,851 +1,310 @@
-# Automotive Sensor Fault Detection & Isolation (FDI)
+# QNX Assist Parking
 
-### QNX 8.0 • Raspberry Pi 5 • Real-Time Automotive Safety Prototype
+### Real-Time Sensor Fault Detection, Isolation & Recovery on QNX Neutrino 8.0
 
-> **A real-time automotive sensor monitoring and fault-tolerant
-> parking-assist prototype that detects abnormal sensor behaviour,
-> isolates unreliable sensors, attempts recovery, and maintains degraded
-> operation using redundant sensing.**
+![QNX](https://img.shields.io/badge/QNX_Neutrino-8.0-black)
+![Platform](https://img.shields.io/badge/Raspberry_Pi_5-AArch64-c51a4a)
+![Language](https://img.shields.io/badge/language-C-blue)
+![Deadline misses](https://img.shields.io/badge/deadline_misses-0_%2F_500-brightgreen)
+![WCET](https://img.shields.io/badge/worst--case_FDI-289_%C2%B5s_of_5000_%C2%B5s-brightgreen)
 
-------------------------------------------------------------------------
+> A parking-assist prototype that **doesn't trust its sensors blindly.**
+> Redundant ultrasonic sensors and IMUs are continuously checked for four classes
+> of fault. A bad sensor is isolated in the same cycle it is confirmed faulty, the
+> application degrades gracefully, and when the last valid range is gone the system
+> says **UNSAFE** rather than inventing a distance.
 
-## 1. Project Overview
+---
 
-Modern automotive systems depend on sensors whose measurements directly
-influence safety-critical decisions. A sensor may fail without
-completely stopping: it can become **stuck, stale, noisy, delayed, or
-contradictory** while continuing to produce apparently valid data.
+## At a Glance
 
-This project implements a **Sensor Fault Detection & Isolation (FDI)
-system** on **QNX 8.0 running on a Raspberry Pi 5**.
+| | Result | Evidence |
+|---|---|---|
+| **Worst-case FDI execution** | **289 µs** against a **5,000 µs** per-cycle budget | Measured, 500 cycles |
+| **Deadline misses** | **0 / 500** | Measured |
+| **Budget consumed (worst case)** | **5.78 %** — about **17× headroom** | Derived |
+| **Average FDI execution** | **63 µs** (1.3 % of budget) | Measured |
+| **Fault detect → isolate** | **Same cycle** (Δ = 0 µs); ~222 ms from onset for ultrasonic, ~224 ms for IMU | Measured |
+| **Fault classes** | Stuck-at · Stale/Delayed · Noisy · Contradictory | Source-verified |
+| **Degradation ladder** | `FULL → DEGRADED/SINGLE → DEGRADED/HOLDOVER → UNSAFE` | Observed in live run |
+| **System load during trace** | 98.9 % idle across 4 cores (3 s System Profiler capture) | Measured |
 
-The prototype uses:
+---
 
--   **2 × Ultrasonic sensors** for redundant distance measurement
--   **2 × IMUs** for redundant motion sensing
--   QNX real-time threads and priority scheduling
--   Message-queue based communication
--   A small sensor history buffer
--   Fault detection and classification
--   Sensor health state management
--   Isolation and recovery/probing
--   Degraded and holdover operation
--   Fault timeline logging
--   QNX System Profiler for runtime analysis
+## Why This Is Interesting on QNX
 
-The system was developed by starting with a small two-sensor prototype
-and progressively building the complete FDI architecture around it.
+Sensor failures are rarely clean. A sensor that is *stuck, stale, noisy or in disagreement with its twin* still produces plausible-looking numbers, and a plausible wrong number is more dangerous than no number.
 
-------------------------------------------------------------------------
+This project shows that a full **detect → classify → isolate → recover → degrade** pipeline can run on a QNX RTOS with a **worst-case cost of 289 µs**, using native microkernel primitives rather than polling or shared state:
 
-# 2. Problem Statement
+- **Event-driven acquisition.** Ultrasonic echo edges arrive as QNX **pulses** on a private channel (`ChannelCreate(_NTO_CHF_PRIVATE)` → `ConnectAttach` → `MsgReceivePulse`) bounded by `TimerTimeout`. The acquisition thread *blocks* instead of spinning on a GPIO register, yet still resolves a microsecond-scale pulse width.
+- **Priority-ordered tasks.** `SCHED_FIFO` with fault detection (25) > recovery (20) > sensor/fusion (15) > logging (5), so best-effort logging can never preempt fault handling.
+- **Bounded data path.** A static, fixed-size 10-sample circular history per sensor, with no dynamic allocation, so per-cycle work has a hard upper bound.
+- **Direct hardware access from user space.** MPU6050 over I²C via `devctl()` / `DCMD_I2C_SENDRECV`; HC-SR04 over GPIO; timestamps from `clock_gettime()`.
+- **Observability.** Validated with the **QNX System Profiler** (`.kev` trace) alongside in-application timing instrumentation.
 
-### Automotive Sensor Fault Detection & Isolation
+---
 
-**Detect failed, stale, or inconsistent sensors and maintain safe
-operation.**
+## System Architecture
 
-The system must:
-
-1.  Monitor redundant vehicle sensors.
-2.  Identify abnormal sensor behaviour.
-3.  Classify faults.
-4.  Isolate unreliable sensors.
-5.  Attempt bounded recovery.
-6.  Continue operation using available healthy information.
-7.  Maintain a record of the fault timeline.
-8.  Demonstrate deterministic, real-time task execution on QNX.
-
-------------------------------------------------------------------------
-
-# 3. Objectives
-
-The prototype is designed to demonstrate:
-
--   Real-time sensor acquisition
--   Redundant sensor monitoring
--   Sensor calibration
--   Timestamped sensor data
--   Sensor health tracking
--   Fault classification
--   Fault isolation
--   Recovery and probing
--   Sensor reintegration
--   Fault-tolerant sensor fusion
--   Degraded operation
--   QNX IPC using message queues
--   Priority-based real-time scheduling
--   Runtime fault logging
--   System profiling
-
-------------------------------------------------------------------------
-
-# 4. System Architecture
-
-``` text
-                         QNX 8.0
-                      Raspberry Pi 5
-                            │
-             ┌──────────────┴──────────────┐
-             │                             │
-       SENSOR ACQUISITION             APPLICATION
-             │                             │
-      ┌──────┼────────┐                    │
-      │      │        │                    │
-     US1    US2     IMU1 ───── IMU2        │
-      │      │        │          │         │
-      └──────┴────────┴──────────┘         │
-                    │                      │
-                    ▼                      │
-             Sensor Data Layer             │
-                    │                      │
-                    ▼                      │
-             Small Sensor Buffer            │
-                    │                      │
-                    ▼                      │
-             Sensor / Fusion                │
-                    │                      │
-                    ▼                      │
-              Fault Detector                │
-                    │                      │
-          ┌─────────┼──────────┐           │
-          │         │          │           │
-       Detection Classification Health     │
-          │                      │           │
-          ▼                      │           │
-       SUSPECT                   │           │
-          │                      │           │
-          ▼                      │           │
-       PROBING                   │           │
-          │                      │           │
-       ┌──┴──────┐               │           │
-       │         │               │           │
-   Recovered   Failed            │           │
-       │         │               │           │
-       ▼         ▼               │           │
-    HEALTHY   EXCLUDED           │           │
-                   │             │           │
-                   └──────► DEGRADED ◄─────┘
-                              │
-                              ▼
-                           HOLDOVER
-
-          Fault / State Events
-                   │
-                   ▼
-                Logger
-                   │
-                   ▼
-             Fault Timeline
+```text
+   HC-SR04 ×2 (GPIO)                    MPU6050 ×2 (I²C, 0x68 / 0x69)
+   echo edges → QNX pulses              devctl / DCMD_I2C_SENDRECV
+          │                                        │
+          └──────────────┬─────────────────────────┘
+                         ▼
+              ┌───────────────────────┐
+              │  Sensor + Fusion      │  prio 15   acquire · timestamp · fuse
+              └──────────┬────────────┘
+                         │  sensor_sample_t  (value[] + value_count)
+                         ▼
+              ┌───────────────────────┐
+              │  Circular history     │  10 samples / sensor, static, no malloc
+              └──────────┬────────────┘
+                         ▼
+              ┌───────────────────────┐
+              │  Fault Detector       │  prio 25   4 checks + state machine
+              └───────┬───────┬───────┘
+                      │       │
+        recovery cmd  │       │  log events
+                      ▼       ▼
+              ┌────────────┐  ┌────────────┐
+              │ Recovery   │  │  Logger    │
+              │ prio 20    │  │  prio 5    │
+              └────────────┘  └─────┬──────┘
+                                    ▼
+                         /tmp/fault_timeline.log
 ```
 
-------------------------------------------------------------------------
+Tasks communicate through message queues (`/mq_sensor_data`, `/mq_recovery_cmd`, `/mq_recovery_result`, `/mq_log_events`), which keeps each stage's responsibility and failure domain separate.
 
-# 5. Sensor Redundancy
+| Task | Role | Scheduling | Priority |
+|---|---|---|---|
+| Fault Detector | Detect, classify, drive state machine | `SCHED_FIFO` | **25** |
+| Recovery | Probe, validate, reintegrate | `SCHED_FIFO` | **20** |
+| Sensor + Fusion | Acquire, timestamp, fuse | `SCHED_FIFO` | **15** |
+| Logger | Fault timeline, best-effort | `SCHED_FIFO` | **5** |
 
-The current prototype uses **identical redundancy**.
+*Rationale:* a slow or blocked recovery probe must never delay classification of a fault already in flight, and logging must never preempt anything safety-relevant.
 
-### Ultrasonic redundancy
+---
 
-``` text
-ULTRASONIC 1 ─────┐
-                  ├──► Redundant distance information
-ULTRASONIC 2 ─────┘
+## One Detection Engine, Two Sensor Types
+
+`fdi_detect()` is a single generic engine. Because every sample carries `value[]` and `value_count`, **the same code path serves 1-value ultrasonic sensors and 6-value IMUs**. Only the thresholds differ. Checks run in a fixed order and return the first fault found.
+
+| Fault | Rule | Ultrasonic | IMU |
+|---|---|---|---|
+| **Delayed / Stale** | Time since last sample exceeds timeout (or no sample ever received) | 500 ms | 500 ms |
+| **Stuck-at** | Over a full 10-sample window, every component's (max − min) is below threshold | 0.5 cm | 0.01 g / 0.01 °/s |
+| **Noisy** | Over a full 10-sample window, any component's (max − min) exceeds threshold | 30 cm | 5 g / 5 °/s |
+| **Contradictory** | Euclidean distance to the redundant partner's latest sample exceeds threshold | 70 cm | 5 (vector distance, tunable) |
+
+**Debounce:** three consecutive detections are required to escalate, and three consecutive clean cycles to de-escalate, so a single glitch does not exclude a healthy sensor.
+
+### Per-Sensor State Machine
+
+```mermaid
+stateDiagram-v2
+    [*] --> HEALTHY
+    HEALTHY --> SUSPECT: fault detected
+    SUSPECT --> HEALTHY: 3 clean cycles
+    SUSPECT --> FAULTED: 3 consecutive faults
+    FAULTED --> EXCLUDED: auto-isolate, same cycle
+    EXCLUDED --> PROBING: auto re-probe
+    PROBING --> VALIDATING: clean reading
+    PROBING --> EXCLUDED: fault
+    VALIDATING --> HEALTHY: 3 clean cycles
+    VALIDATING --> EXCLUDED: fault
 ```
 
-### IMU redundancy
+Isolation is automatic: an excluded sensor is removed from fusion the same cycle it is marked faulty, with no external command. The measured timeline confirms it: for every sensor, **isolate time equals detect time**.
 
-``` text
-IMU 1 ────────────┐
-                  ├──► Redundant motion information
-IMU 2 ────────────┘
+---
+
+## Graceful Degradation, Captured Live
+
+The application changes behaviour as sensors are lost. This is a trimmed excerpt from a real run on the Raspberry Pi 5 (an object was brought steadily closer to the ultrasonic pair):
+
+```text
+[PARKING] dist=22.7cm (+/-1.7)  zone=SLOW           mode=FULL                 src=2
+[FDI] US1=HEALTHY  US2=HEALTHY  IMU1=HEALTHY IMU2=HEALTHY
+   ...
+[PARKING] dist=10.1cm (+/-1.7)  zone=CRITICAL/STOP  mode=FULL                 src=2
+[FDI] US1=HEALTHY  US2=HEALTHY  IMU1=HEALTHY IMU2=HEALTHY
+[PARKING] dist=11.0cm (+/-2.2)  zone=CRITICAL/STOP  mode=FULL                 src=2
+[FDI] US1=SUSPECT  US2=SUSPECT  IMU1=HEALTHY IMU2=HEALTHY
+[PARKING] dist=10.8cm (+/-15.0) zone=CRITICAL/STOP  mode=DEGRADED/SINGLE      src=1
+[FDI] US1=EXCLUDED US2=SUSPECT  IMU1=HEALTHY IMU2=HEALTHY
+[PARKING] dist=12.8cm (+/-4.8)  zone=CRITICAL/STOP  mode=DEGRADED/HOLDOVER    src=0
+[FDI] US1=EXCLUDED US2=EXCLUDED IMU1=HEALTHY IMU2=HEALTHY
+[PARKING] dist=12.8cm (+/-38.5) zone=CRITICAL/STOP  mode=DEGRADED/HOLDOVER    src=0
+[PARKING] NO VALID RANGE        zone=CRITICAL/STOP  mode=UNSAFE               held=1.6s
 ```
 
-The architecture was designed with the broader concept of redundant
-sensing in mind, including functional redundancy. The demonstrated
-prototype focuses on **identical redundancy**, where two sensors of the
-same type provide comparable information.
+| Stage | Sensors available | Behaviour |
+|---|---|---|
+| **FULL** | US1 + US2 | Fused distance from both sensors |
+| **DEGRADED / SINGLE** | one ultrasonic sensor | Continues on the survivor; uncertainty widens to ±15 cm |
+| **DEGRADED / HOLDOVER** | none | Last good distance (12.8 cm) is held, and its **uncertainty grows ≈2.8 cm every cycle** |
+| **UNSAFE** | none | After ≈1.6 s of holdover, reports `NO VALID RANGE` instead of a stale number |
 
-------------------------------------------------------------------------
+Two design choices stand out. The reported **±uncertainty** tells the consumer how much to trust the number as evidence ages. And the explicit **UNSAFE** state gives braking and warning logic something it can act on, which a plausible-but-wrong distance would not.
 
-# 6. Fault Detection
+Later in the same run both IMUs also failed (`SUSPECT` at ~16.3 s, `EXCLUDED` at ~16.7 s), and the system correctly held `UNSAFE` with all four sensors excluded through the end of the trace (56.6 s).
 
-The FDI engine monitors sensor behaviour and maintains an individual
-health state for each sensor.
+---
 
-The target fault classes are:
+## Real-Time Results
 
-  -----------------------------------------------------------------------
-  Fault                               Description
-  ----------------------------------- -----------------------------------
-  **STUCK-AT**                        Sensor output remains effectively
-                                      unchanged for consecutive samples
+All figures below come from the application's built-in `FDI REAL-TIME METRICS` reporting, taken from five consecutive checkpoints of one continuous run.
 
-  **STALE / DELAYED**                 Expected sensor updates stop or
-                                      become too old
+### FDI execution time vs. deadline
 
-  **NOISY**                           Sensor variation exceeds the
-                                      configured noise threshold
+| Cycles | Min (µs) | Avg (µs) | Max / WCET (µs) | Deadline (µs) | Misses |
+|---:|---:|---:|---:|---:|---:|
+| 100 | 33 | 56 | 235 | 5,000 | **0** |
+| 200 | 33 | 59 | 289 | 5,000 | **0** |
+| 300 | 33 | 61 | 289 | 5,000 | **0** |
+| 400 | 33 | 63 | 289 | 5,000 | **0** |
+| 500 | 33 | 63 | 289 | 5,000 | **0** |
 
-  **CONTRADICTORY**                   Redundant sensors provide
-                                      inconsistent measurements
-  -----------------------------------------------------------------------
-
-The detector does not treat every abnormal reading as an immediate
-permanent failure.
-
-Instead, the system uses sensor states.
-
-------------------------------------------------------------------------
-
-# 7. Sensor Health State Machine
-
-``` text
-                 ┌───────────┐
-                 │  HEALTHY  │
-                 └─────┬─────┘
-                       │
-                 abnormal evidence
-                       │
-                       ▼
-                 ┌───────────┐
-                 │  SUSPECT  │
-                 └─────┬─────┘
-                       │
-                       ▼
-                 ┌───────────┐
-                 │  PROBING  │
-                 └─────┬─────┘
-                       │
-                ┌──────┴──────┐
-                │             │
-            Recovered       Failed
-                │             │
-                ▼             ▼
-           ┌─────────┐   ┌──────────┐
-           │ HEALTHY │   │ EXCLUDED │
-           └─────────┘   └──────────┘
+```text
+Deadline            ████████████████████████████████████████  5000 µs
+Worst case (289 µs) ██▎                                        5.78 %
+Average    (63 µs)  ▌                                          1.26 %
 ```
 
-This allows the system to distinguish between:
+- **Worst-case utilization:** 289 / 5000 = **5.78 %**
+- **Remaining margin:** 5000 − 289 = **4,711 µs**
+- The maximum **plateaued at 289 µs from cycle 200 onward** and did not grow over the next 300 cycles, including through the period where all four sensors were being excluded.
 
--   a temporary abnormal condition,
--   an active recovery attempt,
--   and a sensor that should no longer participate in normal operation.
+> The 289 µs figure is the maximum *observed* over 500 cycles of one run. It is not a formally derived or certified WCET.
 
-------------------------------------------------------------------------
+### How the 5 ms deadline is met
 
-# 8. Fault Isolation & Recovery
+The margin is a consequence of design decisions, not tuning:
 
-When a sensor becomes unreliable, the Fault Detector sends a recovery
-command.
+1. **Fixed-size, allocation-free history.** A static 10-slot circular buffer per sensor means no `malloc`, no unbounded growth and no allocator jitter in the hot path.
+2. **Constant-shape detection.** Four checks, always in the same order, over a window of at most 10 samples. Per-cycle work is bounded by construction.
+3. **One engine, no per-sensor special cases.** The generic `value[]` / `value_count` design avoids extra code paths in the timing-critical loop.
+4. **Blocking, event-driven acquisition.** Echo timing uses `MsgReceivePulse` bounded by `TimerTimeout`, so acquisition neither burns CPU nor can block detection indefinitely.
+5. **Priority separation.** Detection runs at the highest application priority, recovery below it, logging lowest, so slow probes and I/O do not interfere with classification.
+6. **Debounced state machine.** Confirmation counters keep the common path cheap and stop transient glitches from triggering isolation and recovery work.
+7. **Auto-isolation in the same cycle.** No extra round-trip is needed to remove a faulty sensor from fusion.
 
-``` text
-Fault Detected
-      │
-      ▼
-   SUSPECT
-      │
-      ▼
-   PROBING
-      │
-      ▼
- Check sensor health
-      │
- ┌────┴─────┐
- │          │
-Healthy    Failed
- │          │
- ▼          ▼
-Reintegrate EXCLUDE
-            │
-            ▼
-       Degraded Mode
-```
+### Fault response latency
 
-Recovery is bounded by a finite number of attempts and a finite recovery
-window.
+| Sensor | Transitions | Detect | Isolate |
+|---|---:|---:|---:|
+| US1 | 1 | 221.944 ms | 221.944 ms |
+| US2 | 1 | 222.110 ms | 222.110 ms |
+| IMU1 | 1 | 224.002 ms | 224.002 ms |
+| IMU2 | 1 | 224.002 ms | 224.002 ms |
 
-The recovery mechanism checks whether the sensor resumes publishing
-valid measurements instead of inventing a hardware reset that may not
-exist for the sensor.
+### QNX System Profiler
 
-------------------------------------------------------------------------
+A 3-second `.kev` trace of the running system:
 
-# 9. Fault-Tolerant Parking Operation
+| Metric | Value |
+|---|---:|
+| Trace duration | 3.000 s |
+| CPUs | 4 |
+| Total events | 154,872 |
+| Dropped buffers | **0** |
+| Idle | **98.9 %** |
+| User | 0.3 % |
+| Kernel | 0.8 % |
 
-The FDI system is integrated with the parking-assist application.
+> These are whole-system figures for the capture window, not the isolated CPU use of `assist_parking`. The 5.78 % above is the FDI task's own share of its 5 ms budget, a different measurement.
 
-During a sensor fault, the application can continue using available
-sensor information.
+### Sampling-loop timing
 
-Example runtime output:
+The sensor/fusion loop is configured for a 100 ms (10 Hz) period. Measured deviation from nominal was **10.99 ms minimum, 14.00 ms maximum, ≈11.9 ms average**. Every cycle deviated by a similar amount, so the spread is only about 3 ms. That pattern looks like a fixed per-cycle overhead (sleep-based period plus sensor acquisition time) rather than random scheduling noise, and root-causing it is on the roadmap below. This is separate from FDI execution time, which stayed under 289 µs.
 
-``` text
-[PARKING] dist=40.3cm (+/-5.0)
-zone=CAUTION
-mode=DEGRADED/SINGLE
-src=1
+---
 
-[FDI] US1=HEALTHY US2=SUSPECT
-      IMU1=HEALTHY IMU2=HEALTHY
-```
+## Engineering Decisions
 
-The fault then progresses:
+- **Acquisition left untouched.** The proven GPIO/I²C timing, edge detection and register handling were preserved. The ultrasonic driver is unmodified; the IMU driver was restructured into callable functions with identical register addresses, calibration math and conversion constants (16384 LSB/g, 131 LSB/(°/s)).
+- **Simplified the data path.** An early shared-memory-plus-mutex design added synchronization complexity for no benefit. Replacing it with a small bounded history buffer made the path easier to reason about and to time.
+- **Detection and recovery are separate responsibilities.** The detector identifies faults; recovery performs bounded probing and reports back.
+- **Calibration first.** Redundant sensors do not produce identical numbers, so each IMU is identified and calibrated independently at start-up:
 
-``` text
-US2 = SUSPECT
-        ↓
-US2 = PROBING
-        ↓
-US2 = EXCLUDED
-```
-
-The parking application continues operating in degraded mode.
-
-When both ultrasonic sensors become unavailable, the system demonstrates
-a holdover state:
-
-``` text
-[FDI] US1=EXCLUDED US2=EXCLUDED
-      IMU1=HEALTHY IMU2=HEALTHY
-
-[PARKING] mode=DEGRADED/HOLDOVER
-```
-
-This demonstrates that fault handling is connected to application
-behaviour rather than being only a diagnostic printout.
-
-------------------------------------------------------------------------
-
-# 10. IMU Identification & Calibration
-
-The two IMUs are independently identified and calibrated.
-
-Example:
-
-``` text
+```text
 Sensor 0x68 WHO_AM_I = 0x70
 Sensor 0x69 WHO_AM_I = 0x68
+[CALIB] Done 0x68 -> Accel Offsets (g)     | X:  0.008 | Y: -0.014 | Z:  0.006
+[CALIB] Done 0x68 -> Gyro Offsets (deg/s)  | X: -0.615 | Y:  4.161 | Z: -1.575
+[CALIB] Done 0x69 -> Accel Offsets (g)     | X:  0.077 | Y:  0.015 | Z:  0.195
+[CALIB] Done 0x69 -> Gyro Offsets (deg/s)  | X: -0.525 | Y: -0.293 | Z:  0.523
 ```
 
-Calibration is performed while the vehicle is stationary.
+---
 
-Example calibration output:
+## Hardware & Software
 
-``` text
-[CALIB] Done 0x68 -> Accel Offsets (g)
-X: 0.009 | Y: -0.014 | Z: 0.006
+| | |
+|---|---|
+| **Compute** | Raspberry Pi 5 (AArch64) |
+| **Ultrasonic** | 2 × HC-SR04, GPIO trigger/echo |
+| **IMU** | 2 × MPU6050 on shared I²C bus (`/dev/i2c1`, addresses 0x68 / 0x69) |
+| **OS** | QNX Neutrino RTOS 8.0 |
+| **Toolchain** | QNX Momentics IDE, `qcc` (`gcc_ntoaarch64le`), C |
+| **QNX / POSIX APIs** | `ChannelCreate`, `ConnectAttach`, `MsgReceivePulse`, `TimerTimeout`, `devctl`, `clock_gettime`, `pthread`, `SCHED_FIFO`, POSIX message queues |
+| **Analysis** | QNX System Profiler, on-target FDI metrics, fault timeline log |
 
-[CALIB] Done 0x68 -> Gyro Offsets (deg/s)
-X: -0.541 | Y: 4.222 | Z: -1.595
-```
+### Source layout
 
-The second IMU is calibrated independently.
-
-Calibration was an important early stage of the project because
-redundant sensors cannot simply be assumed to produce identical
-numerical measurements.
-
-------------------------------------------------------------------------
-
-# 11. Data Architecture
-
-One of the major design decisions was simplifying the sensor data path.
-
-An early approach considered using shared memory and mutex-protected
-access.
-
-``` text
-Sensor
-   ↓
-Shared Memory
-   ↓
-Mutex
-   ↓
-Consumer
-```
-
-This introduced unnecessary synchronization complexity and became a
-bottleneck during prototyping.
-
-The architecture was therefore simplified to:
-
-``` text
-Sensor
-   ↓
-Acquire
-   ↓
-Normalize
-   ↓
-Timestamp
-   ↓
-Sensor Buffer
-   ↓
-Fault/Fusion Processing
-```
-
-The sensor buffer maintains a small history of recent readings.
-
-This was sufficient for temporal fault checks while keeping the data
-path bounded and easier to reason about.
-
-------------------------------------------------------------------------
-
-# 12. QNX Real-Time Architecture
-
-The project uses QNX mechanisms directly for the real-time system
-structure.
-
-### Main mechanisms
-
--   POSIX threads
--   `SCHED_FIFO`
--   Thread priorities
--   POSIX message queues
--   Timed message operations
--   QNX device interfaces
--   Real-time clock/timestamping
--   System Profiler tracing
-
-### Logical task structure
-
-``` text
-Sensor Tasks
-     │
-     ▼
-Sensor / Fusion
-     │
-     ▼
-Fault Detector
-     │
-     ├────────► Recovery
-     │
-     └────────► Logger
-```
-
-The Fault Detector is treated as the highest-priority application task,
-with Recovery below it and Logger at a lower priority.
-
-This allows fault handling to receive scheduling priority over less
-critical logging work.
-
-------------------------------------------------------------------------
-
-# 13. Inter-Task Communication
-
-The architecture uses message queues for task communication.
-
-Conceptually:
-
-``` text
-Sensor Tasks
-     │
-     │ sensor readings
-     ▼
-/mq_sensor_data
-     │
-     ▼
-Fault Detector
-     │
-     │ recovery command
-     ▼
-/mq_recovery_cmd
-     │
-     ▼
-Recovery Task
-     │
-     │ recovery result
-     ▼
-/mq_recovery_result
-     │
-     ▼
-Fault Detector
-
-Fault Detector / Recovery
-     │
-     │ log event
-     ▼
-/mq_log_events
-     │
-     ▼
-Logger
-```
-
-The queues provide clear communication boundaries between the major
-components.
-
-------------------------------------------------------------------------
-
-# 14. Fault Timeline
-
-The Logger records sensor state transitions and fault events.
-
-Example:
-
-``` text
-US2 → SUSPECT
-US2 → PROBING
-US2 → EXCLUDED
-
-US1 → SUSPECT
-US1 → PROBING
-
-US1 → EXCLUDED
-US2 → EXCLUDED
-```
-
-The timeline provides an auditable sequence of what happened during a
-fault event.
-
-------------------------------------------------------------------------
-
-# 15. QNX System Profiler
-
-The completed system was also analysed using the QNX System Profiler.
-
-A captured `.kev` trace provided:
-
-  Metric              Observed value
-  ----------------- ----------------
-  Trace duration             3.000 s
-  CPUs                             4
-  Total events               154,872
-  Dropped buffers                  0
-  Idle activity                98.9%
-  User activity                 0.3%
-  Kernel activity               0.8%
-
-The captured trace therefore showed approximately **98.9% system idle
-time** during that measurement window.
-
-The profiler was also used to inspect:
-
--   CPU activity
--   Per-CPU execution
--   Thread activity
--   Inter-CPU communication
--   System timeline behaviour
-
-> **Note:** The values above describe the captured system trace and
-> should not be interpreted as the isolated CPU consumption of the
-> `assist_parking` application.
-
-------------------------------------------------------------------------
-
-# 16. Hardware & Software
-
-## Hardware
-
--   Raspberry Pi 5
--   2 × Ultrasonic sensors
--   2 × IMU sensors
--   Automotive/parking-assist prototype setup
-
-## Software
-
--   QNX 8.0
--   QNX Momentics IDE
--   QNX System Profiler
--   C
--   QNX/POSIX APIs
--   Message Queues
--   Real-time threads
-
-------------------------------------------------------------------------
-
-# 17. Project Structure
-
-A simplified logical structure is:
-
-``` text
+```text
 assist_parking/
-│
 ├── src/
-│   ├── main.c
-│   ├── sensor_manager.c
-│   ├── sensor_buffer.c
-│   ├── ultrasonic_driver.c
-│   ├── imu_driver.c
-│   ├── fusion.c
-│   ├── fault_detector.c
-│   ├── recovery_task.c
-│   └── logger_task.c
-│
-├── include/
-│   ├── sensor_common.h
-│   ├── fault_common.h
-│   ├── sensor_buffer.h
-│   ├── sensor_manager.h
-│   ├── ultrasonic_driver.h
-│   ├── imu_driver.h
-│   └── fusion.h
-│
-└── README.md
+│   ├── main.c               # loop, evaluation, parking decision, status output
+│   ├── sensor_manager.c     # single hand-off point from drivers to buffers
+│   ├── sensor_buffer.c      # 10-sample circular history per sensor
+│   ├── fault_detection.c    # fdi_detect() + state machine
+│   ├── ultrasonic_driver.c  # HC-SR04 via GPIO + QNX pulses
+│   └── imu_driver.c         # MPU6050 via I²C devctl
+├── include/                 # sensor_buffer.h, sensor_manager.h, fault_detection.h,
+│                            # ultrasonic_driver.h, imu_driver.h, mq_names.h
+└── Makefile
 ```
 
-> The exact source layout may differ from this logical representation
-> depending on the Momentics project configuration.
+> Layout is logical and may differ slightly from the Momentics project configuration.
 
-------------------------------------------------------------------------
+Fault events are written to `/tmp/fault_timeline.log` on the target, giving an auditable sequence of every state transition.
 
-# 18. Runtime Flow
+---
 
-A normal system cycle looks like:
+## Scope, Limitations & Roadmap
 
-``` text
-1. Sensor acquisition
-        ↓
-2. Timestamp and normalize
-        ↓
-3. Store recent samples
-        ↓
-4. Sensor/fusion processing
-        ↓
-5. Fault evaluation
-        ↓
-6. Update sensor health
-        ↓
-7. If fault:
-        SUSPECT
-          ↓
-        PROBING
-          ↓
-     RECOVER / EXCLUDE
-        ↓
-8. Continue in normal or degraded mode
-        ↓
-9. Log the event
-```
+This is a **functional real-time prototype**, not a production safety system. No ISO 26262 / ASIL certification is claimed. Known gaps are listed openly:
 
-------------------------------------------------------------------------
+| Area | Current status | Next step |
+|---|---|---|
+| **Recovery end to end** | PROBING → VALIDATING → HEALTHY is implemented, but the recorded run never cleared its faults, so no reintegration was observed (recover = 0 µs) | Controlled test: remove the fault condition and measure probe → validate → reintegrate latency |
+| **IMU identification** | `WHO_AM_I` returned `0x70` / `0x68`; initialization does not gate on it | Investigate wiring / address strap / part variant; raise it as a start-up warning |
+| **Loop-period offset** | ≈11.9 ms average deviation on a 100 ms period (see above) | Confirm `SCHED_FIFO` priority and contending work; trace with System Profiler |
+| **WCET** | 289 µs is observed, not certified | Longer runs, stress and fault-injection campaigns, formal analysis |
+| **Fault test coverage** | One continuous live run with mixed conditions | Isolated single-fault-type test cases |
 
-# 19. Demonstrated Scenario
+**Beyond the prototype:** functional (cross-modality) redundancy, CAN-FD and automotive-grade sensors, N-modular redundancy, plausibility cross-checks, hardware-in-the-loop fault injection as an on-ramp to ASIL-B, persistent fault storage, and a sensor-health dashboard.
 
-A representative fault scenario is:
+---
 
-### Step 1 --- Normal operation
+## Conclusion
 
-``` text
-US1 = HEALTHY
-US2 = HEALTHY
-IMU1 = HEALTHY
-IMU2 = HEALTHY
-```
-
-### Step 2 --- US2 becomes suspicious
-
-``` text
-US1 = HEALTHY
-US2 = SUSPECT
-```
-
-### Step 3 --- Recovery begins
-
-``` text
-US2 = PROBING
-```
-
-### Step 4 --- Recovery fails
-
-``` text
-US2 = EXCLUDED
-```
-
-### Step 5 --- System continues
-
-``` text
-mode = DEGRADED/SINGLE
-```
-
-### Step 6 --- Additional degradation
-
-If both ultrasonic sensors become unavailable:
-
-``` text
-US1 = EXCLUDED
-US2 = EXCLUDED
-```
-
-the system enters:
-
-``` text
-mode = DEGRADED/HOLDOVER
-```
-
-while the available healthy sensing remains visible to the system.
-
-------------------------------------------------------------------------
-
-# 20. Engineering Journey
-
-This project was deliberately developed incrementally.
-
-We did not begin with the final architecture.
-
-We began with **two sensors** and tried to make the smallest useful
-system work.
-
-The first challenges were not advanced algorithms. They were practical
-engineering problems:
-
--   sensor calibration,
--   synchronization,
--   data abstraction,
--   communication between stages,
--   synchronization overhead,
--   process interference,
--   debugging real hardware,
--   and understanding what the RTOS was actually doing.
-
-An early shared-memory/mutex approach introduced more complexity than
-necessary. Replacing it with a small bounded sensor buffer made the data
-path considerably simpler.
-
-That simplification became a central architectural principle:
-
-> **Keep the sensor interface simple, keep the data path bounded, and
-> let each subsystem have one clear responsibility.**
-
-Once that foundation worked, the rest of the system could be built
-around it:
-
-``` text
-Acquisition
-    ↓
-Buffer
-    ↓
-Fusion
-    ↓
-FDI
-    ↓
-Recovery
-    ↓
-Isolation
-    ↓
-Degraded Operation
-    ↓
-Logging
-```
-
-The most satisfying stage was when every part of that architecture
-became observable on the actual Raspberry Pi:
-
-``` text
-sensor fault
-    ↓
-SUSPECT
-    ↓
-PROBING
-    ↓
-EXCLUDED
-    ↓
-DEGRADED OPERATION
-```
-
-At that point, the architecture was no longer just a diagram.
-
-It was a running system.
-
-------------------------------------------------------------------------
-
-# 21. Key Technical Takeaways
-
-### 1. Redundancy needs comparable data
-
-Two physical sensors do not automatically produce identical numerical
-values. Calibration, timing, and sensor characteristics matter.
-
-### 2. Abstraction should reduce complexity
-
-The final sensor interface intentionally hides sensor-specific
-acquisition details from downstream processing.
-
-### 3. Bounded data structures matter in real-time systems
-
-A small sensor history buffer provides the temporal context needed for
-fault detection without introducing an unnecessarily complicated
-shared-memory architecture.
-
-### 4. Detection and recovery are different responsibilities
-
-The Fault Detector identifies abnormal behaviour. The Recovery Task
-performs bounded probing and reports the result.
-
-### 5. Fault handling must affect the application
-
-A fault is meaningful only when the system responds to it. The
-parking-assist application therefore changes operating mode as sensor
-availability changes.
-
-### 6. Profiling validates assumptions
-
-The QNX System Profiler provides visibility into CPU activity, thread
-execution, and system behaviour instead of relying only on theoretical
-estimates.
-
-
-------------------------------------------------------------------------
-
-# 22. Future Extensions
-
-The prototype can be extended with:
-
--   Functional redundancy across different sensor modalities
--   Additional automotive sensors
--   Hardware-level sensor reset/reinitialization
--   More sophisticated statistical fault models
--   Persistent fault storage
--   Sensor-health dashboard
--   Python/Qt/Web visualization
--   More extensive stress and fault-injection testing
--   Longer-duration CPU and scheduling measurements
--   Additional QNX trace analysis
-
-------------------------------------------------------------------------
-
-# 23. Conclusion
-
-This project demonstrates a complete prototype of an automotive **Sensor
-Fault Detection & Isolation** architecture on QNX.
-
-The central idea is simple:
-
-``` text
+```text
 Don't just detect the failure.
 
-Detect it.
-Understand it.
-Isolate it.
-Try to recover it.
-And keep the vehicle function operating with what remains healthy.
+Detect it.  Classify it.  Isolate it.  Try to recover it.
+Keep the vehicle function running on what remains healthy.
+And when nothing trustworthy is left, say so.
 ```
 
-The project began as a small two-sensor experiment and evolved into a
-real-time system containing sensor acquisition, buffering, redundancy,
-fault detection, recovery, isolation, degraded operation, logging, and
-system profiling.
+Fault-tolerant sensing, running on QNX, in **289 µs worst case against a 5 ms budget, with zero deadline misses.**
 
-The final result is not intended to represent a production automotive
-safety system. It is a **functional real-time prototype demonstrating
-the architecture and engineering principles required for fault-tolerant
-automotive sensing**.
-
-------------------------------------------------------------------------
-
-## Platform
-
-**Target:** Raspberry Pi 5\
-**RTOS:** QNX 8.0\
-**Development Environment:** QNX Momentics IDE\
-**Language:** C\
-**Application:** Automotive Parking Assist with Sensor FDI\
-**Redundancy Demonstrated:** Identical sensor redundancy\
-**Sensors:** 2 × Ultrasonic + 2 × IMU\
-**IPC:** POSIX/QNX Message Queues\
-**Profiling:** QNX System Profiler
-
-------------------------------------------------------------------------
+---
 
 ## License
 
